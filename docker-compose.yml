@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  # ── API Server ──────────────────────────────────────
+  api:
+    build: .
+    command: uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - SD_ENV=dev
+      - SD_DATABASE_URL=postgresql://dashboard:dashboard@postgres:5432/stock_dashboard
+      - SD_REDIS_URL=redis://redis:6379/0
+      - SD_FMP_API_KEY=${FMP_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/app
+    working_dir: /app
+
+  # ── Celery Worker ───────────────────────────────────
+  worker:
+    build: .
+    command: celery -A pipeline.tasks worker --loglevel=info --concurrency=2
+    environment:
+      - SD_ENV=dev
+      - SD_DATABASE_URL=postgresql://dashboard:dashboard@postgres:5432/stock_dashboard
+      - SD_REDIS_URL=redis://redis:6379/0
+      - SD_FMP_API_KEY=${FMP_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/app
+    working_dir: /app
+
+  # ── Celery Beat (Scheduler) ────────────────────────
+  beat:
+    build: .
+    command: celery -A pipeline.tasks beat --loglevel=info
+    environment:
+      - SD_ENV=dev
+      - SD_DATABASE_URL=postgresql://dashboard:dashboard@postgres:5432/stock_dashboard
+      - SD_REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+    working_dir: /app
+
+  # ── PostgreSQL ──────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: stock_dashboard
+      POSTGRES_USER: dashboard
+      POSTGRES_PASSWORD: dashboard
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # ── Redis ───────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:
