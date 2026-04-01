@@ -15,10 +15,15 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional
 
 from config.settings import settings
+from config.specifications import (
+    FUNDAMENTAL_FILTERS,
+    TECHNICAL_FILTERS,
+    INTRADAY_FILTERS,
+)
 from core.schemas import FilterResult
 from filters.base import CompositeFilter, FilterConfig
 from filters.fundamental import build_fundamental_filters
@@ -33,35 +38,12 @@ from storage.repositories import (
 logger = logging.getLogger(__name__)
 
 
-# ── Default filter configs ───────────────────────────────────────
-# These can be overridden via API or config file.
-
-DEFAULT_FUNDAMENTAL_FILTERS = [
-    FilterConfig(name="market_cap", params={"min_cap": 100_000_000}, weight=1.0, required=True),
-    FilterConfig(name="volume", params={"min_volume": 200_000}, weight=0.8, required=True),
-    FilterConfig(name="price", params={"min_price": 5.0}, weight=0.5, required=True),
-    FilterConfig(name="valuation", params={"max_pe": 60, "min_roe": 0.03}, weight=1.5, required=False),
-    FilterConfig(name="growth", params={"min_revenue_growth": 0.0, "min_eps_growth": 0.0}, weight=1.0, required=False),
-]
-
-DEFAULT_TECHNICAL_FILTERS = [
-    FilterConfig(name="trend", params={"max_pct_below_52w_high": 0.30}, weight=2.0, required=False),
-    FilterConfig(name="momentum", params={"rsi_min": 35, "rsi_max": 80}, weight=1.5, required=False),
-    FilterConfig(name="relative_strength", params={"min_percentile": 50}, weight=1.5, required=False),
-]
-
-DEFAULT_INTRADAY_FILTERS = [
-    FilterConfig(name="spread", params={"max_spread_pct": 1.0}, weight=1.0, required=False),
-    FilterConfig(name="intraday_momentum", params={"min_change_pct": -5}, weight=1.0, required=False),
-]
-
-
 class PipelineResult:
     """Container for a complete pipeline run result."""
 
     def __init__(self, run_id: str):
         self.run_id = run_id
-        self.timestamp = datetime.utcnow()
+        self.timestamp = datetime.now(UTC)
         self.universe_size: int = 0
         self.tier1_passed: int = 0
         self.tier2_passed: int = 0
@@ -117,7 +99,7 @@ async def run_pipeline(
         return result
 
     # ── Step 2: Tier 1 — Fundamental Filters ─────────────────────
-    fund_configs = fundamental_configs or DEFAULT_FUNDAMENTAL_FILTERS
+    fund_configs = fundamental_configs or FUNDAMENTAL_FILTERS
     fund_filters = build_fundamental_filters(fund_configs)
     tier1 = CompositeFilter(fund_filters)
     tier1_results = await tier1.apply(all_symbols)
@@ -142,7 +124,7 @@ async def run_pipeline(
     )[:settings.max_stocks_tier2]
 
     # ── Step 3: Tier 2 — Technical Filters ───────────────────────
-    tech_configs = technical_configs or DEFAULT_TECHNICAL_FILTERS
+    tech_configs = technical_configs or TECHNICAL_FILTERS
     tech_filters = build_technical_filters(tech_configs)
     tier2 = CompositeFilter(tech_filters)
     tier2_results = await tier2.apply(tier1_symbols)
@@ -165,7 +147,7 @@ async def run_pipeline(
     # ── Step 4: Tier 3 — Intraday Filters (optional) ────────────
     tier3_scores: dict[str, float] = {}
     if not skip_intraday and tier2_symbols:
-        intra_configs = intraday_configs or DEFAULT_INTRADAY_FILTERS
+        intra_configs = intraday_configs or INTRADAY_FILTERS
         intra_filters = build_intraday_filters(intra_configs)
         tier3 = CompositeFilter(intra_filters)
         tier3_results = await tier3.apply(tier2_symbols)

@@ -58,7 +58,7 @@ class TrendFilter(StockFilter):
 
         results = []
         for symbol in symbols:
-            df = await repo.get_daily_df(symbol, lookback_days=260)  # ~1 year
+            df = await repo.get_daily_df(symbol, lookback_days=370)  # ~252 trading days
             if df is None or len(df) < 200:
                 results.append(FilterResult(
                     symbol=symbol, passed=False, score=0,
@@ -74,8 +74,8 @@ class TrendFilter(StockFilter):
             sma200 = _compute_sma(close, 200).iloc[-1]
             sma200_prev = _compute_sma(close, 200).iloc[-20]  # 1 month ago
 
-            high_52w = close.rolling(252).max().iloc[-1]
-            low_52w = close.rolling(252).min().iloc[-1]
+            high_52w = close.rolling(252, min_periods=200).max().iloc[-1]
+            low_52w = close.rolling(252, min_periods=200).min().iloc[-1]
 
             # Trend template checks
             checks = {
@@ -216,9 +216,11 @@ class RelativeStrengthFilter(StockFilter):
         lookback = self.config.params.get("lookback_days", 63)  # ~3 months
 
         # Calculate returns for all symbols
+        # Convert trading days to calendar days for the repo query
+        calendar_days = int(lookback * 365 / 252) + 10
         returns: dict[str, float] = {}
         for symbol in symbols:
-            df = await repo.get_daily_df(symbol, lookback_days=lookback + 10)
+            df = await repo.get_daily_df(symbol, lookback_days=calendar_days)
             if df is not None and len(df) >= lookback:
                 close = df["close"]
                 ret = (close.iloc[-1] / close.iloc[-lookback]) - 1
