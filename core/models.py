@@ -56,6 +56,10 @@ class Fundamental(Base):
     symbol: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
 
+    # Market data (needed by filters)
+    market_cap: Mapped[Optional[float]] = mapped_column(Float)
+    price: Mapped[Optional[float]] = mapped_column(Float)
+
     # Valuation
     pe_ratio: Mapped[Optional[float]] = mapped_column(Float)
     forward_pe: Mapped[Optional[float]] = mapped_column(Float)

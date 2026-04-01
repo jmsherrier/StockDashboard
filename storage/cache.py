@@ -17,11 +17,14 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 _redis_client = None
+_redis_failed = False  # Once True, stop retrying Redis connections
 _fallback_cache: dict[str, Any] = {}
 
 
 async def _get_redis():
-    global _redis_client
+    global _redis_client, _redis_failed
+    if _redis_failed:
+        return None
     if _redis_client is not None:
         return _redis_client
     try:
@@ -36,6 +39,7 @@ async def _get_redis():
         return _redis_client
     except Exception as e:
         logger.warning("Redis unavailable (%s), using in-memory fallback", e)
+        _redis_failed = True
         return None
 
 

@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     provider_eod_prices: str = "fmp"
     provider_historical: str = "fmp"
     provider_intraday: str = "fmp"
-    provider_universe: str = "fmp"
+    provider_universe: str = "yfinance"  # FMP stock-list requires paid plan
 
     # --- Pipeline ---
     universe_refresh_cron: str = "0 5 * * 1"    # Monday 5am

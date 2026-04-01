@@ -43,9 +43,8 @@ def _run_sync(func, *args, **kwargs):
 
 class YFinanceUniverseProvider(UniverseProvider):
     """
-    yfinance doesn't have a stock list endpoint.
-    This uses a static list of S&P 500 / Russell 3000 symbols
-    or falls back to a user-provided list.
+    Fetches stock universe from Wikipedia (S&P 500 + NASDAQ-100) using pandas.
+    No API key required. Good enough for dev and small universes.
     """
 
     async def get_stock_list(
@@ -53,11 +52,95 @@ class YFinanceUniverseProvider(UniverseProvider):
         exchange: Optional[str] = None,
         min_market_cap: Optional[float] = None,
     ) -> list[StockInfo]:
-        logger.warning(
-            "yfinance has no universe endpoint. Use FMP or provide a symbol list. "
-            "Returning empty list."
-        )
-        return []
+        import io
+        import urllib.request
+
+        import pandas as pd
+
+        def _fetch_html_tables(url: str) -> list[pd.DataFrame]:
+            """Fetch HTML tables with a proper User-Agent to avoid 403."""
+            req = urllib.request.Request(url, headers={"User-Agent": "stock-dashboard/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8")
+            return pd.read_html(io.StringIO(html))
+
+        loop = asyncio.get_event_loop()
+        stocks: list[StockInfo] = []
+        seen_symbols: set[str] = set()
+
+        # Fetch S&P 500 from Wikipedia
+        try:
+            sp500_tables = await loop.run_in_executor(
+                None,
+                partial(_fetch_html_tables, "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"),
+            )
+            if sp500_tables:
+                df = sp500_tables[0]
+                for _, row in df.iterrows():
+                    symbol = str(row.get("Symbol", "")).replace(".", "-")
+                    if symbol and symbol not in seen_symbols:
+                        seen_symbols.add(symbol)
+                        stocks.append(StockInfo(
+                            symbol=symbol,
+                            name=str(row.get("Security", "")),
+                            exchange=str(row.get("Exchange", "")),  # Not always present
+                            sector=str(row.get("GICS Sector", "")),
+                            industry=str(row.get("GICS Sub-Industry", "")),
+                            country="US",
+                        ))
+            logger.info("Fetched %d S&P 500 stocks from Wikipedia", len(stocks))
+        except Exception as e:
+            logger.warning("Failed to fetch S&P 500 from Wikipedia: %s", e)
+
+        # Fetch NASDAQ-100 from Wikipedia (adds ~40 more not in S&P 500)
+        try:
+            nasdaq_tables = await loop.run_in_executor(
+                None,
+                partial(_fetch_html_tables, "https://en.wikipedia.org/wiki/Nasdaq-100"),
+            )
+            added = 0
+            if nasdaq_tables:
+                # Find the table with ticker/symbol column
+                for table in nasdaq_tables:
+                    # Flatten MultiIndex columns if present
+                    if hasattr(table.columns, 'levels'):
+                        table.columns = [
+                            str(c[-1]) if isinstance(c, tuple) else str(c)
+                            for c in table.columns
+                        ]
+                    cols = [str(c).lower() for c in table.columns]
+                    if "ticker" in cols or "symbol" in cols:
+                        col = "Ticker" if "ticker" in cols else "Symbol"
+                        for _, row in table.iterrows():
+                            symbol = str(row.get(col, "")).replace(".", "-")
+                            if symbol and symbol not in seen_symbols:
+                                seen_symbols.add(symbol)
+                                company = str(row.get("Company", row.get("Security", "")))
+                                stocks.append(StockInfo(
+                                    symbol=symbol,
+                                    name=company,
+                                    exchange="NASDAQ",
+                                    country="US",
+                                ))
+                                added += 1
+                        break
+            logger.info("Fetched %d additional NASDAQ-100 stocks from Wikipedia", added)
+        except Exception as e:
+            logger.warning("Failed to fetch NASDAQ-100 from Wikipedia: %s", e)
+
+        if not stocks:
+            logger.error("Could not fetch any stock universe from Wikipedia")
+            return []
+
+        # Apply exchange filter
+        if exchange:
+            ex_upper = exchange.upper()
+            stocks = [s for s in stocks if s.exchange and ex_upper in s.exchange.upper()]
+
+        # Note: market cap filtering skipped here (Wikipedia doesn't provide it).
+        # S&P 500 stocks all have market cap > $100M so the default filter is met.
+        logger.info("Universe: %d stocks after filters", len(stocks))
+        return stocks
 
     async def get_stock_profile(self, symbol: str) -> Optional[StockInfo]:
         if yf is None:
@@ -90,6 +173,8 @@ class YFinanceFundamentalsProvider(FundamentalsProvider):
             return FundamentalData(
                 symbol=symbol,
                 snapshot_date=date.today(),
+                market_cap=info.get("marketCap"),
+                price=info.get("currentPrice", info.get("regularMarketPrice")),
                 pe_ratio=info.get("trailingPE"),
                 forward_pe=info.get("forwardPE"),
                 peg_ratio=info.get("pegRatio"),

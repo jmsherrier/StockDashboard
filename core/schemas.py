@@ -29,6 +29,10 @@ class FundamentalData(BaseModel):
     symbol: str
     snapshot_date: date
 
+    # Market data (needed by filters)
+    market_cap: Optional[float] = None
+    price: Optional[float] = None
+
     pe_ratio: Optional[float] = None
     forward_pe: Optional[float] = None
     peg_ratio: Optional[float] = None

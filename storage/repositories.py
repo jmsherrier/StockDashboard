@@ -54,7 +54,11 @@ class StockRepository:
             if exchange:
                 stmt = stmt.where(Stock.exchange == exchange)
             if min_market_cap:
-                stmt = stmt.where(Stock.market_cap >= min_market_cap)
+                # Include stocks with unknown (NULL) market cap — they haven't
+                # been enriched yet and shouldn't be excluded prematurely.
+                stmt = stmt.where(
+                    (Stock.market_cap >= min_market_cap) | (Stock.market_cap.is_(None))
+                )
             result = await session.execute(stmt)
             return [row[0] for row in result.all()]
 

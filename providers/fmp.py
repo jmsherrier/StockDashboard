@@ -1,11 +1,22 @@
 """
 Financial Modeling Prep (FMP) provider implementation.
 
+Uses the /stable/ API (v3 endpoints were deprecated August 2025).
+
 FMP is the recommended default because:
 - Free tier: 250 req/day, enough for dev and small universes
 - Starter ($19/mo): unlimited calls, 20GB bandwidth, full fundamentals
 - Single API covers universe + fundamentals + EOD + intraday + screener
 - Clean JSON, well-documented, Python-friendly
+
+Free-tier availability (as of 2026):
+  /stable/profile         ✓   /stable/quote           ✓
+  /stable/key-metrics     ✓   /stable/ratios          ✓
+  /stable/historical-price-eod/full  ✓
+  /stable/search-name     ✓
+  /stable/stock-list      ✗ (paid)
+  /stable/stock-screener  ✗ (paid)
+  /stable/historical-chart ✗ (paid)
 """
 from __future__ import annotations
 
@@ -27,7 +38,7 @@ from providers.base import (
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://financialmodelingprep.com/api"
+BASE_URL = "https://financialmodelingprep.com"
 
 
 class FMPClient:
@@ -56,7 +67,7 @@ class FMPClient:
         return self._client
 
     async def get(self, path: str, params: Optional[dict] = None) -> Any:
-        """Make a GET request to FMP API."""
+        """Make a GET request to FMP stable API."""
         params = params or {}
         params["apikey"] = self.api_key
         async with self._semaphore:
@@ -68,6 +79,10 @@ class FMPClient:
                 # FMP returns error messages as dicts
                 if isinstance(data, dict) and "Error Message" in data:
                     logger.error("FMP error for %s: %s", path, data["Error Message"])
+                    return None
+                # FMP returns restriction messages as strings
+                if isinstance(data, str) and "Restricted Endpoint" in data:
+                    logger.warning("FMP restricted endpoint: %s", path)
                     return None
                 return data
             except httpx.HTTPStatusError as e:
@@ -103,24 +118,39 @@ class FMPUniverseProvider(UniverseProvider):
         min_market_cap: Optional[float] = None,
     ) -> list[StockInfo]:
         """
-        Uses FMP's /v3/stock/list for the full universe,
-        or /v3/stock-screener for filtered results.
+        Tries /stable/stock-screener (paid), then /stable/stock-list (paid),
+        then falls back to yfinance-style empty result with a warning.
+        On free tier, use yfinance as the universe provider instead.
         """
         client = get_fmp_client()
 
+        data = None
+        used_screener = False
+
         if exchange or min_market_cap:
-            # Use the screener endpoint for server-side filtering
+            # Try the screener endpoint for server-side filtering (paid tier)
             params: dict[str, Any] = {"isActivelyTrading": "true", "limit": 10000}
             if exchange:
                 params["exchange"] = exchange
             if min_market_cap:
                 params["marketCapMoreThan"] = int(min_market_cap)
-            data = await client.get("/v3/stock-screener", params)
-        else:
-            data = await client.get("/v3/stock/list")
+            data = await client.get("/stable/stock-screener", params)
+            if data and isinstance(data, list) and len(data) > 0:
+                used_screener = True
+            else:
+                data = None
 
-        if not data or not isinstance(data, list):
-            return []
+        if not data:
+            # Try the stock list endpoint (also paid on free tier)
+            raw = await client.get("/stable/stock-list")
+            if raw and isinstance(raw, list) and len(raw) > 0:
+                data = raw
+            else:
+                logger.error(
+                    "FMP stock-list and stock-screener are unavailable on your plan. "
+                    "Switch universe provider to yfinance: set SD_PROVIDER_UNIVERSE=yfinance"
+                )
+                return []
 
         results = []
         for item in data:
@@ -136,21 +166,30 @@ class FMPUniverseProvider(UniverseProvider):
                 ))
             except Exception:
                 continue
+
+        # Apply client-side filters when screener wasn't used
+        if not used_screener:
+            if exchange:
+                ex_upper = exchange.upper()
+                results = [s for s in results if s.exchange and s.exchange.upper() == ex_upper]
+            if min_market_cap:
+                results = [s for s in results if s.market_cap and s.market_cap >= min_market_cap]
+
         return results
 
     async def get_stock_profile(self, symbol: str) -> Optional[StockInfo]:
         client = get_fmp_client()
-        data = await client.get(f"/v3/profile/{symbol}")
+        data = await client.get("/stable/profile", {"symbol": symbol})
         if not data or not isinstance(data, list) or len(data) == 0:
             return None
         item = data[0]
         return StockInfo(
             symbol=item.get("symbol", symbol),
             name=item.get("companyName", ""),
-            exchange=item.get("exchangeShortName"),
+            exchange=item.get("exchangeShortName", item.get("exchange")),
             sector=item.get("sector"),
             industry=item.get("industry"),
-            market_cap=item.get("mktCap"),
+            market_cap=item.get("marketCap", item.get("mktCap")),
             country=item.get("country", "US"),
             ipo_date=item.get("ipoDate"),
         )
@@ -163,57 +202,54 @@ class FMPFundamentalsProvider(FundamentalsProvider):
     async def get_fundamentals(self, symbol: str) -> Optional[FundamentalData]:
         client = get_fmp_client()
 
-        # FMP key-metrics-ttm gives trailing-twelve-month ratios in one call
-        data = await client.get(f"/v3/key-metrics-ttm/{symbol}")
+        # Stable API: /stable/key-metrics?symbol=X&period=ttm
+        data = await client.get("/stable/key-metrics", {"symbol": symbol, "period": "ttm"})
         if not data or not isinstance(data, list) or len(data) == 0:
             return None
 
         m = data[0]
 
         # Also get ratios for additional coverage
-        ratios = await client.get(f"/v3/ratios-ttm/{symbol}")
+        ratios = await client.get("/stable/ratios", {"symbol": symbol, "period": "ttm"})
         r = ratios[0] if ratios and isinstance(ratios, list) and len(ratios) > 0 else {}
 
         # And the quote for volume data
-        quote = await client.get(f"/v3/quote/{symbol}")
+        quote = await client.get("/stable/quote", {"symbol": symbol})
         q = quote[0] if quote and isinstance(quote, list) and len(quote) > 0 else {}
 
         return FundamentalData(
             symbol=symbol,
             snapshot_date=date.today(),
-            pe_ratio=m.get("peRatioTTM"),
-            forward_pe=r.get("forwardPERatio"),  # Not always in TTM
-            peg_ratio=m.get("pegRatioTTM"),
-            price_to_book=m.get("priceToBookRatioTTM") or m.get("pbRatioTTM"),
-            price_to_sales=m.get("priceToSalesRatioTTM") or m.get("psRatioTTM"),
-            ev_to_ebitda=m.get("enterpriseValueOverEBITDATTM"),
-            revenue_growth_yoy=m.get("revenueGrowthTTM"),
-            eps_growth_yoy=m.get("epsgrowthTTM"),
-            gross_margin=m.get("grossProfitMarginTTM"),
-            operating_margin=m.get("operatingProfitMarginTTM"),
-            net_margin=m.get("netProfitMarginTTM"),
-            roe=m.get("roeTTM"),
-            roa=m.get("returnOnAssetsTTM") or m.get("roaTTM"),
-            roic=m.get("roicTTM"),
-            debt_to_equity=m.get("debtToEquityTTM") or m.get("debtEquityRatioTTM"),
-            current_ratio=m.get("currentRatioTTM"),
-            quick_ratio=m.get("quickRatioTTM"),
-            interest_coverage=m.get("interestCoverageTTM"),
-            free_cash_flow=m.get("freeCashFlowPerShareTTM"),
-            dividend_yield=m.get("dividendYielTTM") or m.get("dividendYieldTTM"),
-            payout_ratio=m.get("payoutRatioTTM"),
-            avg_volume_10d=q.get("avgVolume"),
-            shares_outstanding=q.get("sharesOutstanding"),
+            market_cap=m.get("marketCap", q.get("marketCap")),
+            price=q.get("price"),
+            pe_ratio=r.get("priceToEarningsRatio"),
+            forward_pe=r.get("forwardPriceToEarningsGrowthRatio"),
+            peg_ratio=m.get("priceToEarningsGrowthRatio", r.get("priceToEarningsGrowthRatio")),
+            price_to_book=r.get("priceToBookRatio"),
+            price_to_sales=r.get("priceToSalesRatio"),
+            ev_to_ebitda=m.get("evToEBITDA"),
+            revenue_growth_yoy=None,  # Not in TTM key-metrics/ratios
+            eps_growth_yoy=None,  # Not in TTM key-metrics/ratios
+            gross_margin=r.get("grossProfitMargin"),
+            operating_margin=r.get("operatingProfitMargin"),
+            net_margin=r.get("netProfitMargin"),
+            roe=m.get("returnOnEquity"),
+            roa=m.get("returnOnAssets"),
+            roic=m.get("returnOnInvestedCapital"),
+            debt_to_equity=r.get("debtToEquityRatio"),
+            current_ratio=m.get("currentRatio", r.get("currentRatio")),
+            quick_ratio=r.get("quickRatio"),
+            interest_coverage=r.get("interestCoverageRatio"),
+            free_cash_flow=r.get("freeCashFlowPerShare"),
+            dividend_yield=r.get("dividendYield"),
+            payout_ratio=r.get("dividendPayoutRatio"),
+            avg_volume_10d=q.get("volume"),
+            shares_outstanding=None,  # Not in stable quote
         )
 
     async def get_fundamentals_bulk(
         self, symbols: Sequence[str]
     ) -> list[FundamentalData]:
-        """
-        FMP doesn't have a true bulk key-metrics endpoint on free tier,
-        so we chunk and parallelize. On paid tiers, you'd use the
-        bulk financial endpoints instead.
-        """
         results = []
         # Process in chunks of 5 (matching semaphore)
         for i in range(0, len(symbols), 5):
@@ -239,18 +275,21 @@ class FMPPriceProvider(PriceProvider):
         end_date: Optional[date] = None,
     ) -> list[OHLCVBar]:
         client = get_fmp_client()
-        params: dict[str, Any] = {}
+        # Stable API: /stable/historical-price-eod/full?symbol=X&from=...&to=...
+        params: dict[str, Any] = {"symbol": symbol}
         if start_date:
             params["from"] = start_date.isoformat()
         if end_date:
             params["to"] = end_date.isoformat()
 
-        data = await client.get(f"/v3/historical-price-full/{symbol}", params)
-        if not data or "historical" not in data:
+        data = await client.get("/stable/historical-price-eod/full", params)
+
+        # Stable API returns a flat array (not nested under "historical")
+        if not data or not isinstance(data, list):
             return []
 
         bars = []
-        for item in data["historical"]:
+        for item in data:
             try:
                 bars.append(OHLCVBar(
                     symbol=symbol,
@@ -260,7 +299,7 @@ class FMPPriceProvider(PriceProvider):
                     low=item["low"],
                     close=item["close"],
                     volume=int(item.get("volume", 0)),
-                    adj_close=item.get("adjClose"),
+                    adj_close=item.get("vwap"),  # stable API has vwap instead of adjClose
                 ))
             except (KeyError, ValueError):
                 continue
@@ -274,7 +313,6 @@ class FMPPriceProvider(PriceProvider):
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
     ) -> dict[str, list[OHLCVBar]]:
-        """Parallelize individual fetches. FMP paid tiers have batch-request-end-of-day-prices."""
         results: dict[str, list[OHLCVBar]] = {}
         for i in range(0, len(symbols), 5):
             chunk = symbols[i:i + 5]
@@ -294,7 +332,7 @@ class FMPIntradayProvider(IntradayProvider):
 
     async def get_quote(self, symbol: str) -> Optional[QuoteSnapshot]:
         client = get_fmp_client()
-        data = await client.get(f"/v3/quote/{symbol}")
+        data = await client.get("/stable/quote", {"symbol": symbol})
         if not data or not isinstance(data, list) or len(data) == 0:
             return None
         q = data[0]
@@ -306,20 +344,19 @@ class FMPIntradayProvider(IntradayProvider):
             day_high=q.get("dayHigh"),
             day_low=q.get("dayLow"),
             prev_close=q.get("previousClose"),
-            change_pct=q.get("changesPercentage"),
+            change_pct=q.get("changePercentage"),
         )
 
     async def get_quotes_bulk(
         self, symbols: Sequence[str]
     ) -> list[QuoteSnapshot]:
-        """FMP supports comma-separated symbols in quote endpoint."""
+        """FMP stable API: pass comma-separated symbols via query param."""
         client = get_fmp_client()
         results = []
-        # FMP allows batching quotes with comma-separated symbols
         for i in range(0, len(symbols), 50):
             chunk = symbols[i:i + 50]
             symbol_str = ",".join(chunk)
-            data = await client.get(f"/v3/quote/{symbol_str}")
+            data = await client.get("/stable/quote", {"symbol": symbol_str})
             if data and isinstance(data, list):
                 for q in data:
                     try:
@@ -331,7 +368,7 @@ class FMPIntradayProvider(IntradayProvider):
                             day_high=q.get("dayHigh"),
                             day_low=q.get("dayLow"),
                             prev_close=q.get("previousClose"),
-                            change_pct=q.get("changesPercentage"),
+                            change_pct=q.get("changePercentage"),
                         ))
                     except (KeyError, ValueError):
                         continue
@@ -344,12 +381,13 @@ class FMPIntradayProvider(IntradayProvider):
         start_date: Optional[date] = None,
     ) -> list[OHLCVBar]:
         client = get_fmp_client()
-        params: dict[str, Any] = {}
+        # Stable API: /stable/historical-chart/{interval}?symbol=X
+        params: dict[str, Any] = {"symbol": symbol}
         if start_date:
             params["from"] = start_date.isoformat()
 
         data = await client.get(
-            f"/v3/historical-chart/{interval}/{symbol}", params
+            f"/stable/historical-chart/{interval}", params
         )
         if not data or not isinstance(data, list):
             return []
